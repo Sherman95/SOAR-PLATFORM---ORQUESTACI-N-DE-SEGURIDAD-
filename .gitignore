@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+
+# Generated data and logs
+data/
+logs/
+reports/
+
+# Generated outputs
+*.jsonl
+*.log
+*.png
