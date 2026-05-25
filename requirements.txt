@@ -1,0 +1,6 @@
+netmiko>=4.3.0
+pysnmp>=6.1.0
+scapy>=2.5.0
+paramiko>=3.3.1
+matplotlib>=3.8.0
+colorama>=0.4.6

@@ -1,0 +1,10 @@
+
+sw-iou#
+sw-iou#terminal width 511
+sw-iou#terminal length 0
+sw-iou#
+sw-iou#
+sw-iou#
+sw-iou#show version | include IOS
+Cisco IOS Software, Solaris Software (I86BI_LINUXL2-ADVENTERPRISEK9-M), Experimental Version 15.1(20130726:213425) [dstivers-july26-2013-team_track 104]
+sw-iou#

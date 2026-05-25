@@ -1,0 +1,6 @@
+Connected (version 2.0, client Cisco-1.25)
+Authentication (password) successful!
+Socket exception: An existing connection was forcibly closed by the remote host (10054)
+Connected (version 2.0, client Cisco-1.25)
+Authentication (password) successful!
+{"ts": 1779666050.7161613, "event": "INCIDENT", "port": "ethernet 0/3", "rate": 285.5, "ok": true, "ms": 1307.2}
