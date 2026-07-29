@@ -1,65 +1,58 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║           SOAR AGENT — Configuración Central                 ║
-║  Proyecto: Orquestación de Seguridad Autónoma en GNS3        ║
-╚══════════════════════════════════════════════════════════════╝
-Editar este archivo para adaptar el agente a tu laboratorio.
-"""
+"""Configuracion central del experimento validado de MAC Flooding."""
 
-# ─── Dispositivo objetivo (Switch IOU en GNS3) ────────────────
+import os
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
 SWITCH = {
     "device_type": "cisco_ios",
-    "host":        "192.168.1.10",   # IP de gestión del Switch IOU
-    "username":    "admin",
-    "password":    "cisco123",
-    "secret":      "cisco123",       # enable secret
-    "timeout":     10,
-    "session_log": "logs/ssh_session.log",
+    "host": os.getenv("SWITCH_HOST", "192.168.1.10"),
+    "username": os.getenv("SWITCH_USERNAME", "admin"),
+    "password": os.getenv("SWITCH_PASS", ""),
+    "secret": os.getenv("SWITCH_SECRET") or os.getenv("SWITCH_PASS", ""),
+    "timeout": 5,
+    "global_delay_factor": 2,
 }
 
-# ─── SNMP ─────────────────────────────────────────────────────
 SNMP = {
-    "host":      "192.168.1.10",
-    "community": "public",
-    "port":      161,
-    "timeout":   2,
-    "retries":   1,
+    "host": os.getenv("SNMP_HOST", "192.168.1.10"),
+    "community": os.getenv("SNMP_COMMUNITY", "public"),
+    "port": 161,
+    "timeout": 2,
+    "retries": 1,
 }
 
-# ─── Umbrales de detección ────────────────────────────────────
-THRESHOLDS = {
-    # MAC Flooding: MACs nuevas por segundo en un puerto → alarma
-    "mac_flood_rate":     5,   # MACs/seg
+# Bloqueo explicito del prototipo no validado. El agente principal no consulta
+# esta bandera ni importa src/experimental/arp.py.
+ENABLE_ARP_DETECTION = False
 
-    # ARP Spoofing: ratio ARP-request / ARP-reply anómalos
-    "arp_ratio_max":      5.0,  # requests por cada reply
+MAC_THRESHOLD_PER_SECOND = 50
+POLL_INTERVAL = 0.5
+SNMP_DEGRADED_AFTER = 3
 
-    # Cantidad de IPs distintas que una MAC puede reclamar
-    "ips_per_mac_max":    3,
-
-    # Segundos de gracia antes de considerar el puerto limpio
-    "clear_grace_period": 30,
-}
-
-# ─── Puertos del switch monitoreados ──────────────────────────
-# Formato: {numero_snmp: "nombre_ios"}
-# El número SNMP viene del OID dot1dTpFdbPort
 PUERTOS = {
-    1: "ethernet 0/0",   # uplink al router
-    2: "ethernet 0/1",   # Victima-1
-    3: "ethernet 0/2",   # Victima-2
-    4: "ethernet 0/3",   # Atacante (Kali)
-    5: "ethernet 0/4",   # Reservado / Agente
+    1: "ethernet 0/0",  # uplink al router
+    2: "ethernet 0/1",  # Victima-1
+    3: "ethernet 0/2",  # Victima-2
+    4: "ethernet 0/3",  # Host del escenario de ataque
+    5: "ethernet 1/0",  # Cloud / Agente
 }
+PROTECTED_INTERFACES = {"Ethernet0/0", "Ethernet1/0"}
+# Alias conservado para no romper integraciones anteriores en español.
+INTERFACES_PROTEGIDAS = PROTECTED_INTERFACES
 
-# Puertos que NUNCA deben bloquearse (uplinks críticos)
-PUERTOS_PROTEGIDOS = {1}
+RESTORE_SETTLE_SECONDS = 3
+KALI_IP = os.getenv("KALI_IP")
+KALI_CONNECTED_INTERFACE = os.getenv("KALI_CONNECTED_INTERFACE")
+MACOF_COMMAND = os.getenv("MACOF_COMMAND", "macof")
 
-# ─── Intervalos de polling ────────────────────────────────────
-POLL_INTERVAL_SEC   = 0.5    # Frecuencia de consulta SNMP
-ARP_WINDOW_SEC      = 5.0    # Ventana de análisis ARP
-
-# ─── Rutas de archivos ────────────────────────────────────────
-LOG_FILE     = "logs/soar_events.jsonl"   # Un JSON por línea
-METRICS_FILE = "logs/metrics.jsonl"
-REPORT_DIR   = "reports/"
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+EXPERIMENT_ROOT = os.path.join(
+    _ROOT, "data", "experiments", "mac_flooding_validation"
+)
+METRICS_FILE = os.path.join(_ROOT, "data", "soar_metrics.jsonl")
+EVENTS_FILE = os.path.join(_ROOT, "data", "soar_events.jsonl")
+HISTORY_FILE = os.path.join(_ROOT, "data", "history_reports.txt")

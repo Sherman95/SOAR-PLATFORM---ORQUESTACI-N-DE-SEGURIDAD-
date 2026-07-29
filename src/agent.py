@@ -1,267 +1,482 @@
 #!/usr/bin/env python3
 """
-SOAR Agent v4.0 — Data-Driven Edition
-Automatización completa: Escribe métricas en JSONL en tiempo real para el Dashboard.
+SOAR Agent — Orquestador Modular
+======================================
+Responsabilidad única: coordinar los módulos y mantener el bucle principal.
+Este archivo NO contiene lógica de red, detección ni mitigación — solo orquesta.
+
+Arquitectura:
+  NetworkManager → gestiona SSH
+  Detector       → detecta MAC Flooding mediante SNMP
+  Mitigador      → ejecuta y verifica shutdown_only
+  Reporter       → registra métricas, eventos e historial
 """
 
-import time, signal, sys, json, os, threading
-from datetime import datetime
-from collections import defaultdict
-from netmiko import ConnectHandler
-from pysnmp.hlapi import (nextCmd, SnmpEngine, CommunityData,
-                          UdpTransportTarget, ContextData,
-                          ObjectType, ObjectIdentity)
+import argparse
+import time
+import signal
+import sys
+import os
+
 from colorama import Fore, Back, Style, init
+
+# ─── Rutas ────────────────────────────────────────────────────────────────────
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.dirname(__file__))
+
+# ─── Configuración ────────────────────────────────────────────────────────────
+from config.settings import (
+    SWITCH, SNMP, MAC_THRESHOLD_PER_SECOND, POLL_INTERVAL,
+    SNMP_DEGRADED_AFTER,
+    PUERTOS, PROTECTED_INTERFACES,
+    EXPERIMENT_ROOT, KALI_CONNECTED_INTERFACE, MACOF_COMMAND,
+)
+from config.version import VERSION_LABEL
+
+# ─── Módulos ──────────────────────────────────────────────────────────────────
+from network   import NetworkManager
+from detector  import CamMonitorState, Detector, calcular_tasa_mac
+from mitigador import Mitigador
+from reporter  import Reporter
+from experiment import ExperimentRun
 
 init(autoreset=True)
 
-# ─── CONFIGURACION ESTRATEGICA ────────────────────────────────
-SWITCH = {
-    "device_type": "cisco_ios",
-    "host":        "192.168.1.10",
-    "username":    "admin",
-    "password":    "cisco123",
-    "secret":      "cisco123",
-    "timeout":     30,
-}
-SNMP_HOST     = "192.168.1.10"
-SNMP_COMM     = "public"
 
-BURST_SNMP    = 25   
-BURST_ARP     = 40   
-POLL_INTERVAL = 0.5
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
 
-PUERTOS = {1: "ethernet 0/0", 2: "ethernet 0/1", 3: "ethernet 0/2", 4: "ethernet 0/3", 5: "ethernet 1/0"}
-PROTEGIDOS = {1, 5}
-PUERTO_ATACANTE_IOS = "ethernet 0/3"
-PUERTO_ATACANTE_NUM = 4
 
-# ─── ARCHIVOS DE DATOS (NUEVO) ────────────────────────────────
-METRICS_FILE = "soar_metrics.jsonl"
-EVENTS_FILE = "soar_events.jsonl"
+def normalizar_interfaz(nombre: str) -> str:
+    return nombre.replace(" ", "").lower()
 
-def clear_screen(): os.system('cls' if os.name == 'nt' else 'clear')
 
 class SOARAgent:
-    def __init__(self):
-        self.conn         = None
-        self.prev_macs    = {}
-        self.bloqueados   = set()
-        self.incidentes   = 0
-        self.polls        = 0
-        self.t_start      = time.time()
-        self.eventos      = []
-        self._running     = True
-        self._arp_count   = 0
-        self._arp_lock    = threading.Lock()
+    """
+    Orquestador principal.
+    Crea y conecta los módulos, ejecuta el bucle de vigilancia
+    y coordina las respuestas ante amenazas detectadas.
+    """
 
-        # Limpiar archivos de métricas al arrancar
-        open(METRICS_FILE, "w").close()
-        open(EVENTS_FILE, "w").close()
+    def __init__(
+        self,
+        observe_only=False,
+        scenario_label="attack",
+        threshold_mac_per_second=MAC_THRESHOLD_PER_SECOND,
+        campaign_id="default",
+    ):
+        self.observe_only = bool(observe_only)
+        self.scenario_label = scenario_label
+        self.threshold_mac_per_second = threshold_mac_per_second
+        self.experiment = ExperimentRun(
+            EXPERIMENT_ROOT,
+            self.threshold_mac_per_second,
+            POLL_INTERVAL,
+            KALI_CONNECTED_INTERFACE,
+            MACOF_COMMAND,
+            scenario_label=self.scenario_label,
+            observe_only=self.observe_only,
+            campaign_id=campaign_id,
+        )
+        self.net       = NetworkManager(SWITCH)
+        self.reporter  = Reporter(
+            None,
+            str(self.experiment.events_file),
+            str(self.experiment.report_file),
+            run_id=self.experiment.run_id,
+        )
+        self.detector  = Detector(self.net, SNMP)
+        self.mitigador = Mitigador(self.net, self.reporter)
+        self.cam_state  = CamMonitorState(SNMP_DEGRADED_AFTER)
+
+        self.incidentes = 0
+        self.anomalias   = 0
+        self.polls      = 0
+        self.snmp_failures_total = 0
+        self.t_start_ns = time.monotonic_ns()
+        self._running   = True
 
         signal.signal(signal.SIGINT, self._stop)
 
-    def conectar_ssh(self) -> bool:
-        try:
-            print(f"{Fore.CYAN} [*] Autenticando en {SWITCH['host']} vía SSH...{Style.RESET_ALL}")
-            self.conn = ConnectHandler(**SWITCH)
-            self.conn.enable()
-            print(f"{Fore.GREEN} [+] SSH Establecido.{Style.RESET_ALL}")
-            return True
-        except: return False
+    def _resolver_objetivo(self, bridge_port: int, new_mac_count: int):
+        """Retorna una identidad bloqueable o alerta y retorna None."""
+        threshold = getattr(
+            self, "threshold_mac_per_second", MAC_THRESHOLD_PER_SECOND
+        )
+        identity = self.detector.resolver_interfaz(bridge_port)
+        if identity is None:
+            print(
+                f"{Back.YELLOW}{Fore.BLACK} INTERFAZ_NO_RESUELTA "
+                f"{Style.RESET_ALL} bridge_port={bridge_port}; no se bloquea."
+            )
+            self.reporter.registrar_alerta(
+                "INTERFAZ_NO_RESUELTA",
+                bridge_port=bridge_port,
+                new_mac_count=new_mac_count,
+                threshold_mac_per_second=threshold,
+            )
+            return None
 
-    def leer_cam(self) -> dict:
-        cam = defaultdict(set)
-        try:
-            for (err, _, _, vbs) in nextCmd(
-                SnmpEngine(), CommunityData(SNMP_COMM, mpModel=1),
-                UdpTransportTarget((SNMP_HOST, 161), timeout=1.0, retries=0),
-                ContextData(), ObjectType(ObjectIdentity("BRIDGE-MIB", "dot1dTpFdbPort")),
-                lexicographicMode=False, maxRows=8000,
-            ):
-                if err: break
-                for vb in vbs:
-                    try:
-                        port = int(str(vb[1]))
-                        mac  = ":".join(f"{int(x):02x}" for x in str(vb[0]).split(".")[-6:])
-                        cam[port].add(mac)
-                    except: pass
-        except: pass
-        return cam
-
-    def leer_y_resetear_arp(self) -> int:
-        with self._arp_lock:
-            count = self._arp_count
-            self._arp_count = 0
-        return count
-
-    def inyectar_metrica(self, rate: int, total_macs: int):
-        # Escribe los datos en vivo para el dashboard
-        metrica = {
-            "ts": time.time() - self.t_start,
-            "port": PUERTO_ATACANTE_NUM,
-            "rate": rate,
-            "total_macs": total_macs
+        protected = {
+            normalizar_interfaz(name) for name in PROTECTED_INTERFACES
         }
-        with open(METRICS_FILE, "a") as f:
-            f.write(json.dumps(metrica) + "\n")
+        if (
+            normalizar_interfaz(identity.if_name) in protected
+            or bridge_port in self.mitigador.bloqueados
+        ):
+            return None
+        return identity
 
-    def bloquear(self, origen, puerto_num, puerto_ios) -> bool:
-        acl_name = f"SOAR-BLOCK-P{puerto_num}"
-        t0       = time.monotonic()
-        try:
-            self.conn.send_config_set([
-                f"interface {puerto_ios}", "shutdown", "exit",
-                f"ip access-list extended {acl_name}", " deny ip any any log", " permit ip any any", "exit",
-                f"interface {puerto_ios}", f" ip access-group {acl_name} in", "exit",
-            ])
-            self.conn.send_command("write memory")
-            
-            elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-            
-            # Escribe el evento de bloqueo para el dashboard
-            evento = {
-                "event_type": "RESPONSE_EXECUTED",
-                "origen": origen,
-                "ts": time.time() - self.t_start,
-                "total_ms": elapsed_ms,
-                "shutdown_ms": round(elapsed_ms * 0.4, 1),
-                "acl_ms": round(elapsed_ms * 0.4, 1)
-            }
-            with open(EVENTS_FILE, "a") as f:
-                f.write(json.dumps(evento) + "\n")
-            
-            self.eventos.append(evento)
-            print(f"{Back.GREEN}{Fore.BLACK} ✓ ACCION {Style.RESET_ALL} {Fore.GREEN}Mitigación Exitosa | Tiempo: {elapsed_ms}ms{Style.RESET_ALL}\n")
-            return True
-        except: return False
+    def _registrar_observacion(
+        self,
+        bridge_port,
+        new_mac_count,
+        rate,
+        poll_started_ns,
+        cam_received_ns,
+        anomaly_identified_ns,
+        actual_poll_interval_ms,
+        snmp_walks=None,
+    ):
+        """Registra la detección sin ejecutar ninguna configuración IOS."""
+        identity = self.detector.resolver_interfaz(bridge_port)
+        detected_interface = identity.if_name if identity else None
+        result = {
+            "event_type": "MAC_FLOOD_OBSERVED",
+            "bridge_port": bridge_port,
+            "if_index": identity.if_index if identity else None,
+            "detected_interface": detected_interface,
+            "new_mac_count": new_mac_count,
+            "mac_rate_per_second": round(rate, 3),
+            "threshold_mac_per_second": self.threshold_mac_per_second,
+            "snmp_read_ms": round(
+                (cam_received_ns - poll_started_ns) / 1_000_000, 3
+            ),
+            "analysis_ms": round(
+                (anomaly_identified_ns - cam_received_ns) / 1_000_000, 3
+            ),
+            "detection_cycle_ms": round(
+                (anomaly_identified_ns - poll_started_ns) / 1_000_000, 3
+            ),
+            "snmp_walks": snmp_walks or [],
+            "actual_poll_interval_ms": actual_poll_interval_ms,
+            "scenario_label": self.scenario_label,
+            "observe_only": True,
+            "configuration_sent": False,
+        }
+        self.reporter.registrar_alerta("MAC_FLOOD_OBSERVED", **result)
+        self.experiment.record_detection(result)
+        interface_text = detected_interface or f"bridge_port={bridge_port}"
+        print(
+            f"\n{Back.YELLOW}{Fore.BLACK} OBSERVACION MAC FLOOD "
+            f"{Style.RESET_ALL} {new_mac_count} MACs, {rate:.1f}/s en "
+            f"{interface_text}; sin shutdown."
+        )
 
-    def restaurar_red(self):
-        if not self.bloqueados: return
-        print(f"\n{Back.YELLOW}{Fore.BLACK} [!] RESTAURANDO PUERTOS... {Style.RESET_ALL}")
-        comandos = []
-        for p in self.bloqueados:
-            p_ios = PUERTOS.get(p, f"e0/{p-1}")
-            acl = f"SOAR-BLOCK-P{p}"
-            comandos.extend([f"interface {p_ios}", "no shutdown", f"no ip access-group {acl} in", "exit", f"no ip access-list extended {acl}"])
-        comandos.append("clear mac address-table dynamic")
-        try:
-            if not self.conn or not self.conn.is_alive(): self.conectar_ssh()
-            self.conn.send_config_set(comandos)
-            print(f"{Fore.GREEN} [+] Red restaurada.{Style.RESET_ALL}")
-        except: pass
+    # ── Inicialización ────────────────────────────────────────────────────────
+    def inicializar(self):
+        """
+        Fase de arranque:
+          1) Conectar SSH
+          2) No modificar VLAN, Port Security ni estado de interfaces
+          3) Calibrar la tabla CAM antes de iniciar la vigilancia
+        """
+        if not self.net.conectar():
+            self.experiment.finalize(status="initialization_failed")
+            sys.exit(1)
 
+
+    # ── Bucle principal ───────────────────────────────────────────────────────
     def run(self):
         clear_screen()
-        if not self.conectar_ssh(): sys.exit(1)
-        
-        print(f"{Fore.CYAN} [*] Calibrando Baseline...{Style.RESET_ALL}")
-        self.prev_macs = self.leer_cam()
-        time.sleep(1)
-        print(f"\n{Back.BLUE}{Fore.WHITE}{Style.BRIGHT} [ INICIANDO VIGILANCIA EN VIVO ] {Style.RESET_ALL}\n")
+        print(f"{Fore.CYAN} [*] Iniciando SOAR Agent {VERSION_LABEL} — Arquitectura Modular{Style.RESET_ALL}")
+        print(
+            f"{Fore.CYAN} [*] Run {self.experiment.run_id}: "
+            f"escenario={self.scenario_label}, "
+            f"campaña={self.experiment.metadata['campaign_id']}, "
+            f"umbral={self.threshold_mac_per_second} MAC/s, "
+            f"modo={'observe_only' if self.observe_only else 'shutdown_only'}."
+            f"{Style.RESET_ALL}"
+        )
+        self.inicializar()
+        self.experiment.capture_switch(self.net, self.experiment.switch_before_file)
+
+        # Calibración del baseline
+        print(f"{Fore.CYAN} [*] Calibrando baseline (3 muestras)...{Style.RESET_ALL}")
+        previous_poll_start_ns = None
+        for baseline_index in range(3):
+            poll_started_ns = time.monotonic_ns()
+            actual_interval_ms = (
+                round((poll_started_ns - previous_poll_start_ns) / 1_000_000, 3)
+                if previous_poll_start_ns is not None else None
+            )
+            previous_poll_start_ns = poll_started_ns
+            result = self.detector.leer_cam()
+            cam_received_ns = time.monotonic_ns()
+            comparison = self.cam_state.observe(result, cam_received_ns)
+            baseline_total = sum(len(macs) for macs in result.entries.values())
+            self.experiment.record_snapshot(
+                result,
+                f"baseline_{baseline_index + 1}",
+                poll_started_ns,
+                actual_interval_ms,
+                rate=0,
+                total_macs=baseline_total,
+            )
+            if comparison is None:
+                self.snmp_failures_total += 1
+                print(
+                    f"{Fore.YELLOW} [!] Muestra de baseline descartada: "
+                    f"{result.error_type}.{Style.RESET_ALL}"
+                )
+                if self.cam_state.telemetry_degraded:
+                    print(
+                        f"{Back.YELLOW}{Fore.BLACK} TELEMETRIA_DEGRADADA "
+                        f"{Style.RESET_ALL}"
+                    )
+                time.sleep(POLL_INTERVAL)
+                continue
+            for macs in result.entries.values():
+                self.detector.baseline_macs.update(macs)
+            time.sleep(POLL_INTERVAL)
+        print(f"{Fore.GREEN} [+] Baseline: {len(self.detector.baseline_macs)} MACs legítimas.{Style.RESET_ALL}")
+        self.experiment.mark_baseline(len(self.detector.baseline_macs))
+
+        print(f"\n{Back.BLUE}{Fore.WHITE}{Style.BRIGHT}"
+              f" [ SOAR {VERSION_LABEL} — VIGILANCIA EN VIVO ] "
+              f"{Style.RESET_ALL}\n")
 
         while self._running:
-            t_ciclo = time.monotonic()
+            poll_started_ns = time.monotonic_ns()
+            actual_poll_interval_ms = (
+                round((poll_started_ns - previous_poll_start_ns) / 1_000_000, 3)
+                if previous_poll_start_ns is not None else None
+            )
+            previous_poll_start_ns = poll_started_ns
             self.polls += 1
-            cam = self.leer_cam()
-            
-            total_macs_switch = sum(len(m) for m in cam.values()) if cam else 0
-            macs_atacante = cam.get(PUERTO_ATACANTE_NUM, set())
-            nuevas = len(macs_atacante - self.prev_macs.get(PUERTO_ATACANTE_NUM, set()))
-            
-            # Guardo la métrica del segundo exacto
-            self.inyectar_metrica(nuevas, total_macs_switch)
 
+            result = self.detector.leer_cam()
+            cam_received_ns = time.monotonic_ns()
+            comparison = self.cam_state.observe(result, cam_received_ns)
+
+            if comparison is None:
+                self.snmp_failures_total += 1
+                failures = self.cam_state.consecutive_failures
+                print(
+                    f"{Fore.YELLOW} [!] SNMP no disponible "
+                    f"({failures} fallo(s)); ciclo sin mitigacion.{Style.RESET_ALL}"
+                )
+                if failures == SNMP_DEGRADED_AFTER:
+                    print(
+                        f"{Back.YELLOW}{Fore.BLACK} TELEMETRIA_DEGRADADA "
+                        f"{Style.RESET_ALL}"
+                    )
+                    self.reporter.registrar_alerta(
+                        "TELEMETRIA_DEGRADADA",
+                        error_type=result.error_type,
+                        error_message=result.error_message,
+                        consecutive_failures=failures,
+                    )
+                self.experiment.record_snapshot(
+                    result,
+                    self.polls,
+                    poll_started_ns,
+                    actual_poll_interval_ms,
+                )
+                elapsed = (time.monotonic_ns() - poll_started_ns) / 1_000_000_000
+                time.sleep(max(0, POLL_INTERVAL - elapsed))
+                continue
+
+            if comparison.recovered_after_failures:
+                print(
+                    f"{Fore.GREEN} [+] TELEMETRIA_RESTAURADA tras "
+                    f"{comparison.recovered_after_failures} fallo(s).{Style.RESET_ALL}"
+                )
+
+            cam = comparison.current_entries
+            prev_macs = comparison.previous_entries
+            total = sum(len(macs) for macs in cam.values())
+            sample_seconds = comparison.elapsed_since_valid
+
+            # La primera lectura valida establece estado, nunca dispara mitigacion.
+            if sample_seconds == 0:
+                for macs in cam.values():
+                    self.detector.baseline_macs.update(macs)
+                self.reporter.registrar_metrica(0, total)
+                self.experiment.record_snapshot(
+                    result,
+                    self.polls,
+                    poll_started_ns,
+                    actual_poll_interval_ms,
+                    rate=0,
+                    total_macs=total,
+                )
+                elapsed = (time.monotonic_ns() - poll_started_ns) / 1_000_000_000
+                time.sleep(max(0, POLL_INTERVAL - elapsed))
+                continue
+
+            nuevas_por_puerto = {
+                puerto: len(macs - prev_macs.get(puerto, set()))
+                for puerto, macs in cam.items()
+            }
+            tasas_por_puerto = {
+                puerto: calcular_tasa_mac(nuevas, sample_seconds)
+                for puerto, nuevas in nuevas_por_puerto.items()
+            }
+            pico_tasa = max(tasas_por_puerto.values(), default=0.0)
+            self.reporter.registrar_metrica(round(pico_tasa, 2), total)
+            self.experiment.record_snapshot(
+                result,
+                self.polls,
+                poll_started_ns,
+                actual_poll_interval_ms,
+                rate=round(pico_tasa, 2),
+                total_macs=total,
+            )
+
+            # ── (A) MAC FLOODING — SNMP ───────────────────────────────────
             for puerto, macs in cam.items():
-                if puerto in PROTEGIDOS or puerto in self.bloqueados: continue
-                nuevas_p = len(macs - self.prev_macs.get(puerto, set()))
-                if nuevas_p >= BURST_SNMP:
-                    p_ios = PUERTOS.get(puerto, f"e0/{puerto-1}")
-                    print(f"\n{Back.RED}{Fore.WHITE} 💥 MAC FLOOD DETECTADO ({nuevas_p} MACs) {Style.RESET_ALL}\n")
-                    if self.bloquear("SNMP", puerto, p_ios):
-                        self.bloqueados.add(puerto)
+                nuevas = nuevas_por_puerto.get(puerto, 0)
+                tasa = tasas_por_puerto.get(puerto, 0.0)
+                if tasa >= self.threshold_mac_per_second:
+                    anomaly_identified_ns = time.monotonic_ns()
+                    self.anomalias += 1
+                    if self.observe_only:
+                        self._registrar_observacion(
+                            puerto,
+                            nuevas,
+                            tasa,
+                            poll_started_ns,
+                            cam_received_ns,
+                            anomaly_identified_ns,
+                            actual_poll_interval_ms,
+                            getattr(result, "snmp_walks", []),
+                        )
+                        continue
+                    self.experiment.record_detection({
+                        "event_type": "MAC_FLOOD_DETECTED",
+                        "bridge_port": puerto,
+                        "new_mac_count": nuevas,
+                        "mac_rate_per_second": round(tasa, 3),
+                        "threshold_mac_per_second": self.threshold_mac_per_second,
+                        "snmp_read_ms": round(
+                            (cam_received_ns - poll_started_ns) / 1_000_000, 3
+                        ),
+                        "analysis_ms": round(
+                            (anomaly_identified_ns - cam_received_ns) / 1_000_000,
+                            3,
+                        ),
+                        "detection_cycle_ms": round(
+                            (anomaly_identified_ns - poll_started_ns) / 1_000_000,
+                            3,
+                        ),
+                        "snmp_walks": getattr(result, "snmp_walks", []),
+                        "scenario_label": self.scenario_label,
+                        "observe_only": False,
+                    })
+                    identity = self._resolver_objetivo(puerto, nuevas)
+                    if identity is None:
+                        continue
+                    ios = identity.if_name
+                    print(f"\n{Back.RED}{Fore.WHITE}"
+                          f" 💥 MAC FLOOD ({nuevas} MACs, {tasa:.1f}/s) en {ios} "
+                          f"{Style.RESET_ALL}")
+                    if self.mitigador.bloquear_mac_flood(
+                        puerto, ios,
+                        if_index=identity.if_index,
+                        new_mac_count=nuevas,
+                        threshold_mac_per_second=self.threshold_mac_per_second,
+                        poll_started_ns=poll_started_ns,
+                        cam_received_ns=cam_received_ns,
+                        anomaly_identified_ns=anomaly_identified_ns,
+                        actual_poll_interval_ms=actual_poll_interval_ms,
+                        snmp_walks=getattr(result, "snmp_walks", []),
+                    ):
                         self.incidentes += 1
+                    if self.mitigador.last_result:
+                        self.experiment.record_mitigation(
+                            self.mitigador.last_result
+                        )
 
-            self.prev_macs = {p: m.copy() for p, m in cam.items()}
-            
+            # Status cada 2 ciclos
             if self.polls % 2 == 0:
-                print(f"{Fore.CYAN} ⚡ [STATUS] Polls: {self.polls:03d} | Tabla CAM: {total_macs_switch:03d} MACs")
+                bloq = self.mitigador.bloqueados
+                print(f"{Fore.CYAN} ⚡ Polls: {self.polls:03d} | "
+                      f"CAM: {total:03d} MACs | "
+                      f"Bloqueados: {bloq if bloq else '∅'}"
+                      f"{Style.RESET_ALL}")
 
-            time.sleep(max(0, POLL_INTERVAL - (time.monotonic() - t_ciclo)))
+            if not self._running:
+                break
+            elapsed = (time.monotonic_ns() - poll_started_ns) / 1_000_000_000
+            time.sleep(max(0, POLL_INTERVAL - elapsed))
+
+        self._finalizar()
 
     def _stop(self, *_):
         self._running = False
-        
-        uptime = round(time.time() - self.t_start, 1)
-        total_polls = self.polls
-        
-        reporte_txt = []
-        reporte_txt.append(f"\n{Fore.CYAN}==================================================")
-        reporte_txt.append(f"{Style.BRIGHT}  REPORTE DETALLADO DEL EXPERIMENTO (SOAR v4.0)")
-        reporte_txt.append(f"=================================================={Style.RESET_ALL}")
-        reporte_txt.append(f"  Fecha/Hora:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        reporte_txt.append(f"  Uptime Misión:    {uptime} s")
-        reporte_txt.append(f"  Monitoreo Core:   {total_polls} ciclos (Muestreo: {POLL_INTERVAL}s)")
-        reporte_txt.append(f"  Incidentes:       {self.incidentes} amenaza(s) detectada(s)")
-        
-        blq_str = ", ".join([PUERTOS.get(p, str(p)) for p in self.bloqueados]) if self.bloqueados else "Ninguno"
-        reporte_txt.append(f"  Interfaces Reg:   [{Fore.RED}{blq_str}{Fore.WHITE}]")
-        
-        if self.eventos:
-            # Extrae el primer evento de mitigación real
-            ev = self.eventos[0]
-            t_resp = ev["total_ms"]
-            reduccion = round((1 - (t_resp / 900000)) * 100, 2)
-            
-            snmp_bl = sum(1 for e in self.eventos if e["origen"] == "SNMP")
-            arp_bl  = sum(1 for e in self.eventos if e["origen"] == "ARP")
-            
-            reporte_txt.append(f"  T. prom resp:     {round(t_resp, 1)} ms")
-            reporte_txt.append(f"  T. min resp:      {round(t_resp, 1)} ms")
-            reporte_txt.append(f"  Reducción KPI:    {reduccion}% vs Respuesta Manual (15 min)")
-            reporte_txt.append(f"  Gatillo SNMP:     {snmp_bl} mitigación(es) activa(s)")
-            reporte_txt.append(f"  Gatillo ARP:      {arp_bl} mitigación(es) activa(s)")
-            
-            # --- Métricas Avanzadas de Ingeniería ---
-            reporte_txt.append(f" --------------------------------------------------")
-            reporte_txt.append(f"  MÉTRICAS METODOLÓGICAS DE INFRAESTRUCTURA")
-            reporte_txt.append(f"  Nivel de Autonomía:  Tier 3 (Full Autonomous Playbook)")
-            reporte_txt.append(f"  Plano de Control:    Inmune (Mitigación sub-segundo)")
-            reporte_txt.append(f"  Integridad de Red:   Aislada (Ataque confinado a Puerto {PUERTO_ATACANTE_NUM})")
-        else:
-            reporte_txt.append(f"  T. prom resp:     N/A (No se registraron ráfagas de ataque)")
-            
-        reporte_txt.append(f"{Fore.CYAN}=================================================={Style.RESET_ALL}")
-        
-        # Imprimir reporte en la consola en vivo
-        for linea in reporte_txt:
-            print(linea)
-            
-        # GUARDAR EN EL HISTORIAL PERSISTENTE DE LA BASE DE DATOS
-        try:
-            import re
-            # Expresión regular para quitar los códigos de color ANSI al guardar en archivo de texto
-            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-            
-            # Asegurar que el directorio exista
-            os.makedirs("data", exist_ok=True)
-            
-            with open("data/history_reports.txt", "a", encoding="utf-8") as f:
-                f.write(f"\n[REGISTRO HISTÓRICO: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n")
-                for linea in reporte_txt:
-                    linea_limpia = ansi_escape.sub('', linea)
-                    f.write(linea_limpia + "\n")
-                f.write("-" * 55 + "\n")
-        except Exception as e:
-            print(f"{Fore.RED} [-] Error al escribir en el historial local: {e}{Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}[!] Deteniendo agente...{Style.RESET_ALL}")
 
-        # Ejecutar la limpieza y restauración automática de la red
-        self.restaurar_red()
-        
-        if self.conn:
-            try: self.conn.disconnect()
-            except: pass
+    # ── Finalización ──────────────────────────────────────────────────────────
+    def _finalizar(self):
+        self.experiment.capture_switch(self.net, self.experiment.switch_after_file)
+        experiment_metrics = self.experiment.finalize()
+        self.reporter.generar_reporte({
+            "uptime":               round(
+                (time.monotonic_ns() - self.t_start_ns) / 1_000_000_000, 1
+            ),
+            "polls":                self.polls,
+            "poll_interval":        POLL_INTERVAL,
+            "incidentes":           self.incidentes,
+            "anomalias":            self.anomalias,
+            "historico_bloqueados": self.mitigador.historico_bloqueados,
+            "interfaces_detectadas": self.mitigador.historico_interfaces,
+            "snmp_failures":         self.snmp_failures_total,
+            "puertos":              PUERTOS,
+            "scenario_label":       self.scenario_label,
+            "observe_only":         self.observe_only,
+            "threshold_mac_per_second": self.threshold_mac_per_second,
+            "classification":       experiment_metrics["classification"],
+        })
+
+        if self.mitigador.blocked_interfaces:
+            print(
+                f"\n{Fore.YELLOW} [!] Restauracion manual requerida para: "
+                f"{', '.join(sorted(self.mitigador.blocked_interfaces))}."
+                f"{Style.RESET_ALL}"
+            )
+            print(
+                f"{Fore.YELLOW}     Use: python run.py restore --interface "
+                f"<INTERFAZ>{Style.RESET_ALL}"
+            )
+        self.net.desconectar()
         sys.exit(0)
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Agente experimental MAC Flooding")
+    parser.add_argument("--observe-only", action="store_true")
+    parser.add_argument(
+        "--scenario", choices=("normal", "attack"), default="attack"
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=MAC_THRESHOLD_PER_SECOND
+    )
+    parser.add_argument("--campaign-id", default="default")
+    args = parser.parse_args()
+    if args.threshold <= 0:
+        parser.error("--threshold debe ser mayor que cero")
+    if args.scenario == "normal" and not args.observe_only:
+        parser.error("un escenario normal requiere --observe-only")
+    return args
+
+
 if __name__ == "__main__":
-    SOARAgent().run()
+    cli_args = parse_args()
+    SOARAgent(
+        observe_only=cli_args.observe_only,
+        scenario_label=cli_args.scenario,
+        threshold_mac_per_second=cli_args.threshold,
+        campaign_id=cli_args.campaign_id,
+    ).run()

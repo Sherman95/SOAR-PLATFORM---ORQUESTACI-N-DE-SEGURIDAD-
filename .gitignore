@@ -5,6 +5,11 @@ __pycache__/
 # Virtual env
 .venv/
 
+# Credenciales locales
+.env
+.env.*
+!.env.example
+
 # Generated data and logs
 data/
 logs/

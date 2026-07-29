@@ -1,6 +1,9 @@
-netmiko>=4.3.0
-pysnmp>=6.1.0
-scapy>=2.5.0
-paramiko>=3.3.1
-matplotlib>=3.8.0
-colorama>=0.4.6
+netmiko==4.7.0
+pysnmp==4.4.12
+pyasn1==0.4.8
+pyasyncore==1.0.5
+paramiko==4.0.0
+matplotlib==3.10.9
+colorama==0.4.6
+python-dotenv==1.2.2
+pytest==9.1.1
